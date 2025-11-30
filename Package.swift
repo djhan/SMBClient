@@ -17,7 +17,11 @@ let package = Package(
   ],
   targets: [
     .target(
-      name: "SMBClient"
+      name: "SMBClient",
+      // library evolution support 를 활성화한다
+      swiftSettings: [
+              .unsafeFlags(["-enable-library-evolution"])
+          ]
     ),
     .testTarget(
       name: "SMBClientTests",
