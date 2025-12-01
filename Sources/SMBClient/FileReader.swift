@@ -43,6 +43,7 @@ public class FileReader {
   }
 
     public func download(offset: UInt64 = 0, length: UInt32 = 0, progressHandler: (_ progress: Double) -> Void = { _ in }) async throws -> Data {
+        let length = length == 0 ? session.maxReadSize : length
         let readSize = length == 0 ? session.maxReadSize : min(length, session.maxReadSize)
         let fileProxy = try await fileProxy()
 
