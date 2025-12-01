@@ -47,7 +47,7 @@ public class FileReader {
 
     //var offset: UInt64 = 0
     var offset = offset
-    let length: UInt32 = length == 0 ? session.maxReadSize : length
+    var length: UInt32 = length == 0 ? session.maxReadSize : length
     var buffer = Data()
 
     var response: Read.Response
@@ -59,10 +59,12 @@ public class FileReader {
       )
 
       buffer.append(response.buffer)
-      offset = UInt64(buffer.count)
+      //offset = UInt64(buffer.count)
+      offset += UInt64(buffer.count)
       progressHandler(Double(offset) / Double(fileProxy.size))
-    } while NTStatus(response.header.status) != .endOfFile && buffer.count < fileProxy.size
-
+    //} while NTStatus(response.header.status) != .endOfFile && buffer.count < fileProxy.size
+    } while NTStatus(response.header.status) != .endOfFile && buffer.count < length && offset + UInt64(buffer.count) < fileProxy.size
+      
     progressHandler(1.0)
     return buffer
   }
