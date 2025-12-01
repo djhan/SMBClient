@@ -61,7 +61,8 @@ public class FileReader {
       buffer.append(response.buffer)
       //offset = UInt64(buffer.count)
       offset += UInt64(buffer.count)
-      progressHandler(Double(offset) / Double(fileProxy.size))
+      //progressHandler(Double(offset) / Double(fileProxy.size))
+        progressHandler(Double(offset) / Double(length))
     //} while NTStatus(response.header.status) != .endOfFile && buffer.count < fileProxy.size
     } while NTStatus(response.header.status) != .endOfFile && buffer.count < length && offset + UInt64(buffer.count) < fileProxy.size
       
