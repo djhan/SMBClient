@@ -1,7 +1,7 @@
 import Foundation
 import Network
 
-public class Connection {
+public class Connection: @unchecked Sendable {
   let host: String
   var onDisconnected: (Error) -> Void
 

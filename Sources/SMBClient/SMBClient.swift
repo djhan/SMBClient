@@ -134,7 +134,7 @@ public class SMBClient {
     public func download(path: String, offset: UInt64, length: UInt32, progressHandler: (_ progress: Double) -> Void) async throws -> Data {
         let fileReader = fileReader(path: Pathname.normalize(path))
         
-        let data = try await fileReader.download(offset: offset, length: length, progressHandler: progressHandler)
+        let data = try await fileReader.read(offset: offset, length: length, progressHandler: progressHandler)
         try await fileReader.close()
         
         return data
