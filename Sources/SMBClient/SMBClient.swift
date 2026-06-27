@@ -54,6 +54,14 @@ public class SMBClient {
     return response
   }
 
+  /// NWConnection을 즉시 강제 종료한다.
+  ///
+  /// - Note: `logoff()` / `disconnectShare()` 없이 TCP 연결을 즉시 취소한다.
+  ///   in-flight `send()` 가 블록된 경우 콜백을 에러로 강제 반환시켜 unblock하는 데 사용한다.
+  public func disconnect() {
+    session.disconnect()
+  }
+
   public func listShares() async throws -> [Share] {
     let shares = try await session.enumShareAll()
     return shares
