@@ -1,5 +1,7 @@
 import Cocoa
 import UniformTypeIdentifiers
+import AVKit
+import Quartz
 import SMBClient
 
 class FilesViewController: NSViewController {
@@ -22,6 +24,20 @@ class FilesViewController: NSViewController {
   private var scrollViewObserving: NSKeyValueObservation?
 
   private var availableSpace: UInt64?
+
+  /// Cache of QuickLookItem objects keyed by SMB path. We need to keep them
+  /// alive across `previewPanel(_:previewItemAt:)` calls so the temp file
+  /// they back is stable, but they're built lazily from the live selection
+  /// rather than snapshotted up front (which would go stale).
+  private var quickLookItemCache: [String: QuickLookItem] = [:]
+
+  // Video overlay laid on top of QLPreviewPanel.contentView. We reuse the
+  // existing SMBAVAsset (AVAssetResourceLoaderDelegate-backed) so playback
+  // streams from SMB without first downloading the file.
+  private var quickLookPlayerView: AVPlayerView?
+  private var quickLookCurrentAsset: SMBAVAsset?
+  private var quickLookCurrentVideoPath: String?
+
   private var dateFormatter: DateFormatter = {
     let dateFormatter = DateFormatter()
     dateFormatter.dateStyle = .medium
@@ -62,6 +78,13 @@ class FilesViewController: NSViewController {
 
     outlineView.doubleAction = #selector(doubleAction(_:))
     outlineView.registerForDraggedTypes([.fileURL])
+    // Without these, NSOutlineView's drag source defaults to .none for
+    // non-local sessions, which silently kills any drag-out to Finder no
+    // matter what file-promise pasteboard data we write. .move enables the
+    // existing within-outline rename/move; .copy enables the drag-out
+    // download path.
+    outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
+    outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
 
     for column in outlineView.tableColumns {
       column.sortDescriptorPrototype = NSSortDescriptor(key: column.identifier.rawValue, ascending: true)
@@ -265,6 +288,277 @@ class FilesViewController: NSViewController {
     openFileNode(fileNode)
   }
 
+  // MARK: - Quick Look
+  //
+  // AppKit's spacebar is NOT auto-routed to `quickLook(with:)` (only F4 is).
+  // Apple's QuickLookDownloader sample intercepts spacebar in its NSTableView
+  // subclass and dispatches a toggle-the-preview-panel selector through the
+  // responder chain. We do the same: `FilesOutlineView` calls
+  // `NSApp.sendAction(#selector(NSResponder.quickLookPreviewItems(_:)), ...)`
+  // which lands here. F4 still works through the standard
+  // `quickLook(with:)` → `quickLookPreviewItems(_:)` chain on NSResponder.
+
+  override func quickLookPreviewItems(_ sender: Any?) {
+    guard let panel = QLPreviewPanel.shared() else { return }
+    if panel.isVisible {
+      panel.orderOut(nil)
+    } else {
+      panel.makeKeyAndOrderFront(nil)
+      // Always force the panel to screen center on open. This sidesteps
+      // AppKit's panel-position persistence — which otherwise drifts
+      // whenever we resize the panel for a large video and have no
+      // reliable way to put back.
+      panel.center()
+    }
+  }
+
+  override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+    true
+  }
+
+  override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+    panel.dataSource = self
+    panel.delegate = self
+  }
+
+  override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+    panel.dataSource = nil
+    panel.delegate = nil
+    removeQuickLookVideoOverlay()
+    // Wipe per-session scratch files (each item has its own UUID-named
+    // subdirectory; deleting that subdir takes the placeholder/downloaded
+    // file with it).
+    for item in quickLookItemCache.values {
+      try? FileManager.default.removeItem(at: item.localURL.deletingLastPathComponent())
+    }
+    quickLookItemCache.removeAll()
+  }
+
+  // MARK: - Video overlay on QLPreviewPanel
+
+  /// Returns true if `extension` is something AVFoundation can play.
+  fileprivate static func isVideoExtension(_ ext: String) -> Bool {
+    MediaPlayerWindowController.supportedExtensions.contains(ext.lowercased())
+  }
+
+  /// Lay (or update) an AVPlayerView on top of the panel's content view for the
+  /// given video file node. If the player view already exists we just swap in
+  /// the new AVPlayerItem; otherwise we install it once. For non-video items
+  /// callers should call `removeQuickLookVideoOverlay()` instead so Apple's
+  /// standard preview underneath becomes visible again.
+  fileprivate func presentQuickLookVideoOverlay(for fileNode: FileNode, smbPath: String) {
+    guard let panel = QLPreviewPanel.shared(),
+          panel.isVisible,
+          let containerView = panel.contentView
+    else { return }
+
+    // Same path is already streaming — nothing to do (avoids re-fetching the
+    // first bytes when the data source happens to query the same item twice).
+    if quickLookCurrentVideoPath == smbPath, quickLookPlayerView?.player != nil {
+      return
+    }
+
+    if quickLookPlayerView == nil {
+      let playerView = AVPlayerView(frame: containerView.bounds)
+      playerView.autoresizingMask = [.width, .height]
+      playerView.controlsStyle = .floating
+      playerView.videoGravity = .resizeAspect
+      playerView.wantsLayer = true
+      playerView.layer?.backgroundColor = NSColor.black.cgColor
+      containerView.addSubview(playerView, positioned: .above, relativeTo: nil)
+      quickLookPlayerView = playerView
+    }
+
+    // Tear down previous asset before installing the new one. SMBAVAsset.close()
+    // closes the underlying FileReader, so we don't leak SMB handles when
+    // arrow-keying through a list of videos.
+    let previousPlayer = quickLookPlayerView?.player
+    quickLookPlayerView?.player = nil
+    previousPlayer?.replaceCurrentItem(with: nil)
+    quickLookCurrentAsset?.close()
+    quickLookCurrentAsset = nil
+
+    let asset = SMBAVAsset(accessor: treeAccessor, path: smbPath)
+    quickLookCurrentAsset = asset
+    quickLookCurrentVideoPath = smbPath
+
+    // Mirror MediaPlayerWindowController.windowDidLoad: read a single byte
+    // through a freshly opened FileReader before handing the SMBAVAsset to
+    // AVPlayer. Sleeping NAS disks block this read at the SMB layer until
+    // they spin up, which is the cleanest way to gate AVPlayer setup.
+    // Without this, AVPlayer's first metadata fetch fails fast on a
+    // sleeping disk and Quick Look stays on a black overlay with no
+    // recovery path (AVPlayer doesn't retry on its own).
+    Task { @MainActor [weak self, treeAccessor, smbPath, asset] in
+      do {
+        let reader = try await treeAccessor.fileReader(path: smbPath)
+        _ = try await reader.read(offset: 0, length: 1)
+        try await reader.close()
+      } catch {
+        return  // Couldn't reach the file at all; bail silently.
+      }
+      guard let self else { return }
+      // The user may have arrow-keyed past this video while we waited.
+      guard self.quickLookCurrentAsset === asset else { return }
+
+      let playerItem = AVPlayerItem(asset: asset)
+      let player = AVPlayer(playerItem: playerItem)
+      self.quickLookPlayerView?.player = player
+      player.play()
+
+      self.resizeQuickLookPanelToVideoSize(of: asset)
+    }
+  }
+
+  /// Resize the QLPreviewPanel to fit the video's natural dimensions, capped
+  /// to 80% of the screen's visible frame and aspect-preserved. We do this
+  /// asynchronously because reading `naturalSize` requires the asset's track
+  /// metadata, which AVFoundation loads on-demand.
+  private func resizeQuickLookPanelToVideoSize(of asset: SMBAVAsset) {
+    Task { @MainActor [weak self, asset] in
+      guard let self else { return }
+      guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return }
+      guard let naturalSize = try? await track.load(.naturalSize),
+            naturalSize.width > 0, naturalSize.height > 0 else { return }
+      // Skip if the user has already navigated to another item.
+      guard self.quickLookCurrentAsset === asset else { return }
+      guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+
+      // Match MediaPlayerWindowController: AVMakeRect inside the screen's
+      // visibleFrame so the longer side stretches all the way to the menu
+      // bar / Dock edges, then cap at naturalSize so small videos aren't
+      // upscaled.
+      guard let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame else { return }
+      let fitted = AVMakeRect(aspectRatio: naturalSize, insideRect: visibleFrame)
+      let contentSize = NSSize(
+        width: min(fitted.width, naturalSize.width),
+        height: min(fitted.height, naturalSize.height)
+      )
+      panel.setContentSize(contentSize)
+      panel.center()
+    }
+  }
+
+  fileprivate func removeQuickLookVideoOverlay() {
+    if let player = quickLookPlayerView?.player {
+      player.pause()
+      player.replaceCurrentItem(with: nil)
+    }
+    quickLookPlayerView?.player = nil
+    quickLookPlayerView?.removeFromSuperview()
+    quickLookPlayerView = nil
+    quickLookCurrentAsset?.close()
+    quickLookCurrentAsset = nil
+    quickLookCurrentVideoPath = nil
+  }
+
+  /// Rows currently selected, sorted by row index. Directories are included
+  /// so Quick Look can show them with folder icon + metadata, mirroring
+  /// Finder's behaviour.
+  fileprivate func selectedNodesForQuickLook() -> [FileNode] {
+    outlineView.selectedRowIndexes
+      .sorted()
+      .compactMap { outlineView.item(atRow: $0) as? FileNode }
+  }
+
+  /// Builds (or returns the cached) `QuickLookItem` for the given file node.
+  ///
+  /// We materialise something on the local disk for every item because
+  /// `QLPreviewItem.previewItemURL` must point at a real `file://` URL:
+  ///
+  /// * **Directory** – an empty local directory is created. Quick Look then
+  ///   falls back to its standard folder preview (folder icon + metadata),
+  ///   matching what Finder shows for directories.
+  /// * **Video** – an empty placeholder file is created with the original
+  ///   extension. The AVPlayerView overlay covers Quick Look's rendering, so
+  ///   the underlying QL preview never matters.
+  /// * **Anything else** – an empty placeholder is created and a full
+  ///   download kicks off in the background. When the bytes land we call
+  ///   `refreshCurrentPreviewItem()` to swap to the real preview. If the
+  ///   download fails or the type isn't previewable, Quick Look's generic
+  ///   icon + metadata view is shown — again mirroring Finder.
+  fileprivate func quickLookItem(for fileNode: FileNode) -> QuickLookItem {
+    let smbPath = dirTree.resolvePath(fileNode)
+    if let cached = quickLookItemCache[smbPath] { return cached }
+
+    // Each item lives in its own subdirectory so the original filename (and
+    // thus extension) is preserved verbatim — this is what Quick Look uses
+    // to pick a preview generator.
+    let scratchParent = QuickLookItem.scratchDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try? FileManager.default.createDirectory(
+      at: scratchParent, withIntermediateDirectories: true
+    )
+    let localURL = scratchParent.appendingPathComponent(fileNode.name)
+
+    let isVideo = !fileNode.isDirectory
+      && Self.isVideoExtension((fileNode.name as NSString).pathExtension)
+    let item: QuickLookItem
+
+    if fileNode.isDirectory {
+      try? FileManager.default.createDirectory(
+        at: localURL, withIntermediateDirectories: true
+      )
+      item = QuickLookItem(title: fileNode.name, smbPath: smbPath, localURL: localURL)
+    } else if isVideo {
+      try? Data().write(to: localURL, options: .atomic)
+      item = QuickLookItem(title: fileNode.name, smbPath: smbPath, localURL: localURL)
+    } else {
+      try? Data().write(to: localURL, options: .atomic)
+      item = QuickLookItem(title: fileNode.name, smbPath: smbPath, localURL: localURL)
+      startQuickLookDownload(for: item)
+    }
+
+    quickLookItemCache[smbPath] = item
+    return item
+  }
+
+  /// Pulls the full content of an SMB file to the temp location backing
+  /// `item.localURL` and asks Quick Look to re-render once the file is on
+  /// disk. We only refresh the panel if the item is still the current one,
+  /// since arrow-keying past it shouldn't yank the visible preview.
+  ///
+  /// NAS disks frequently sleep, and the first SMB read after a sleep can
+  /// fail with a timeout / IO error while the platters spin up. We retry
+  /// with exponential backoff so the preview eventually appears once the
+  /// disk is awake instead of permanently sticking on the blank placeholder.
+  private func startQuickLookDownload(for item: QuickLookItem) {
+    Task { [weak self, treeAccessor, smbPath = item.smbPath, localURL = item.localURL, weak item] in
+      // 1, 2, 4, 8, 16, 32 — ~63 seconds of cumulative wait before giving up,
+      // which comfortably covers a typical NAS spin-up.
+      let backoffSeconds: [UInt64] = [0, 1, 2, 4, 8, 16, 32]
+
+      for backoff in backoffSeconds {
+        if backoff > 0 {
+          do {
+            try await Task.sleep(nanoseconds: backoff * 1_000_000_000)
+          } catch {
+            return  // Task cancelled while waiting — bail.
+          }
+        }
+        do {
+          let data = try await treeAccessor.download(path: smbPath)
+          try data.write(to: localURL, options: .atomic)
+          await MainActor.run {
+            guard self != nil else { return }
+            guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+            if let current = panel.currentPreviewItem as? QuickLookItem,
+               current === item {
+              panel.refreshCurrentPreviewItem()
+            }
+          }
+          return
+        } catch {
+          // Likely a spin-up timeout or transient SMB error. Loop and try
+          // again after the next backoff — unless this was the final
+          // attempt, in which case we silently give up and Quick Look's
+          // generic icon + metadata preview takes over.
+          continue
+        }
+      }
+    }
+  }
+
   @objc
   private func doubleAction(_ sender: NSOutlineView) {
     openContextMenuAction(sender)
@@ -282,18 +576,33 @@ class FilesViewController: NSViewController {
 
   private func openFileNode(_ fileNode: FileNode) {
     if fileNode.isDirectory {
-      guard let navigationController = navigationController() else { return }
-
       let treeAccessor = self.treeAccessor
       let path = dirTree.resolvePath(fileNode)
       let rootPath = self.rootPath
+      let serverNode = self.serverNode
+      let share = self.share
+      let title = fileNode.name
 
-      let filesViewController = FilesViewController.instantiate(
-        accessor: treeAccessor, serverNode: serverNode, share: share, path: path, rootPath: rootPath
-      )
-      filesViewController.title = fileNode.name
+      let makeFilesViewController: () -> FilesViewController = {
+        let vc = FilesViewController.instantiate(
+          accessor: treeAccessor, serverNode: serverNode, share: share, path: path, rootPath: rootPath
+        )
+        vc.title = title
+        return vc
+      }
 
-      navigationController.push(filesViewController)
+      // Cmd-click / Cmd-double-click on a directory opens it in a new tab,
+      // matching Finder's gesture.
+      let cmdHeld = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
+      if cmdHeld {
+        (NSApp.delegate as? AppDelegate)?.openInNewTab(adjacentTo: view.window) { nav in
+          nav.push(makeFilesViewController())
+        }
+        return
+      }
+
+      guard let navigationController = navigationController() else { return }
+      navigationController.push(makeFilesViewController())
     } else {
       let treeAccessor = self.treeAccessor
       let path = dirTree.resolvePath(fileNode)
@@ -324,11 +633,11 @@ class FilesViewController: NSViewController {
 
   private func beginEditing(_ row: Int) {
     guard let _ = outlineView.item(atRow: row) as? FileNode else { return }
-
-    guard let rowView = outlineView.rowView(atRow: row, makeIfNecessary: false) else { return }
-    guard let cellView = rowView.view(atColumn: 0) as? NSTableCellView else { return }
-
-    cellView.window?.makeFirstResponder(cellView.textField)
+    // Drive editing through the table-view entry point. The basename-only
+    // initial selection is handled by `FilenameTextField` when it becomes
+    // first responder; attempting to force the selection here gets
+    // overwritten by AppKit's own select-all as the field editor attaches.
+    outlineView.editColumn(0, row: row, with: nil, select: true)
   }
 
   @IBAction func deleteMenuAction(_ sender: Any?) {
@@ -348,10 +657,13 @@ class FilesViewController: NSViewController {
   }
 
   private func deleteFileNodes(rows: IndexSet) async {
+    let nodes = rows.compactMap { outlineView.item(atRow: $0) as? FileNode }
+    guard !nodes.isEmpty else { return }
+    guard await confirmDeletion(of: nodes) else { return }
+
     var reloadPaths = Set<String>()
     do {
-      for row in rows {
-        guard let fileNode = outlineView.item(atRow: row) as? FileNode else { continue }
+      for fileNode in nodes {
         let path = fileNode.path
 
         if fileNode.isDirectory {
@@ -370,6 +682,45 @@ class FilesViewController: NSViewController {
     } catch {
       NSAlert(error: error).runModal()
     }
+  }
+
+  /// Modal confirmation before destructive deletion. Files on SMB shares are
+  /// removed permanently (no Trash), so make the warning explicit and
+  /// default the safe button (Cancel).
+  @MainActor
+  private func confirmDeletion(of nodes: [FileNode]) async -> Bool {
+    let alert = NSAlert()
+    if nodes.count == 1 {
+      let node = nodes[0]
+      let format = NSLocalizedString(
+        "Are you sure you want to delete “%@”?",
+        comment: "Confirm deletion of a single SMB item"
+      )
+      alert.messageText = String(format: format, node.name)
+    } else {
+      let format = NSLocalizedString(
+        "Are you sure you want to delete these %d items?",
+        comment: "Confirm deletion of multiple SMB items"
+      )
+      alert.messageText = String(format: format, nodes.count)
+    }
+    alert.informativeText = NSLocalizedString(
+      "This operation cannot be undone.",
+      comment: "Permanent deletion warning"
+    )
+    alert.alertStyle = .warning
+
+    let deleteButton = alert.addButton(withTitle: NSLocalizedString("Delete", comment: ""))
+    deleteButton.hasDestructiveAction = true
+    alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
+
+    let response: NSApplication.ModalResponse
+    if let window = view.window {
+      response = await alert.beginSheetModal(for: window)
+    } else {
+      response = alert.runModal()
+    }
+    return response == .alertFirstButtonReturn
   }
 
   @objc
@@ -427,10 +778,21 @@ extension FilesViewController: NSOutlineViewDataSource {
   func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> (any NSPasteboardWriting)? {
     guard let fileNode = item as? FileNode else { return nil }
 
-    let pasteboardItem = NSPasteboardItem()
-    pasteboardItem.setString(fileNode.id.rawValue, forType: .fileURL)
-
-    return pasteboardItem
+    // Use NSFilePromiseProvider so dragging a row onto Finder triggers a
+    // download. The custom `.smbeamSMBPath` type is written alongside the
+    // file promise so internal drops within outlineView (= rename/move)
+    // can still recover the SMB path. UTType picks the file's filename
+    // extension so Finder's drop progress UI gets a sensible icon.
+    let utiIdentifier: String
+    if fileNode.isDirectory {
+      utiIdentifier = UTType.folder.identifier
+    } else {
+      let ext = (fileNode.name as NSString).pathExtension
+      utiIdentifier = UTType(filenameExtension: ext)?.identifier ?? UTType.data.identifier
+    }
+    let provider = SMBFilePromiseProvider(fileType: utiIdentifier, delegate: self)
+    provider.userInfo = SMBPromiseInfo(smbPath: fileNode.path, isDirectory: fileNode.isDirectory)
+    return provider
   }
 
   func outlineView(_ outlineView: NSOutlineView, validateDrop info: any NSDraggingInfo, proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
@@ -466,30 +828,24 @@ extension FilesViewController: NSOutlineViewDataSource {
   }
 
   func outlineView(_ outlineView: NSOutlineView, acceptDrop info: any NSDraggingInfo, item: Any?, childIndex index: Int) -> Bool {
-    guard let fileURLs = info.draggingPasteboard.readObjects(forClasses: [NSURL.self]) else { return false }
-
     if let _ = info.draggingSource as? NSOutlineView {
+      // Internal drag — moves within the share. Source identity is now
+      // carried on the custom `.smbeamSMBPath` pasteboard type written
+      // alongside the file promise (see SMBFilePromiseProvider).
+      let smbPaths: [String] = (info.draggingPasteboard.pasteboardItems ?? []).compactMap {
+        $0.string(forType: .smbeamSMBPath)
+      }
+      let nodes: [FileNode] = smbPaths.compactMap { dirTree.node(ID($0)) }
+      guard !nodes.isEmpty else { return false }
+
       func validate() -> Bool {
-        for fileURL in fileURLs {
-          guard let fileURL = fileURL as? URL else { return false }
-
-          guard let node = dirTree.node(fileURL) else {
-            return false
-          }
-
+        for node in nodes {
           if let fileNode = item as? FileNode {
-            guard fileNode.isDirectory else {
-              return false
-            }
-            if dirTree.parent(of: node) == fileNode {
-              return false
-            }
-
+            guard fileNode.isDirectory else { return false }
+            if dirTree.parent(of: node) == fileNode { return false }
             return true
           } else {
-            if node.isRoot {
-              return false
-            }
+            if node.isRoot { return false }
             return true
           }
         }
@@ -497,20 +853,10 @@ extension FilesViewController: NSOutlineViewDataSource {
       }
 
       if validate() {
-        for fileURL in fileURLs {
-          guard let fileURL = fileURL as? URL else { return false }
-
-          guard let node = dirTree.node(fileURL) else {
-            return false
-          }
-
+        for node in nodes {
           if let fileNode = item as? FileNode {
-            guard fileNode.isDirectory else {
-              return false
-            }
-            if dirTree.parent(of: node) == fileNode {
-              return false
-            }
+            guard fileNode.isDirectory else { return false }
+            if dirTree.parent(of: node) == fileNode { return false }
 
             Task {
               let basename = URL(fileURLWithPath: node.path).lastPathComponent
@@ -521,9 +867,7 @@ extension FilesViewController: NSOutlineViewDataSource {
             }
             continue
           } else {
-            if node.isRoot {
-              return false
-            }
+            if node.isRoot { return false }
 
             Task {
               let basename = URL(fileURLWithPath: node.path).lastPathComponent
@@ -554,6 +898,9 @@ extension FilesViewController: NSOutlineViewDataSource {
         return false
       }
     } else {
+      // External drag — Finder uploads. NSURLs are still on the pasteboard
+      // because Finder writes them itself.
+      guard let fileURLs = info.draggingPasteboard.readObjects(forClasses: [NSURL.self]) else { return false }
       for fileURL in fileURLs {
         guard let fileURL = fileURL as? URL else { return false }
         let queue = TransferQueue.shared
@@ -671,6 +1018,16 @@ extension FilesViewController: NSOutlineViewDelegate {
     dirTree.useCache = false
     updateItemCount()
   }
+
+  func outlineViewSelectionDidChange(_ notification: Notification) {
+    // If our Quick Look panel is up (i.e., we are its data source), keep its
+    // contents in sync with the outline view's selection. This handles both
+    // arrow-key navigation (forwarded from the panel via previewPanel(_:handle:))
+    // and direct mouse selection changes while the panel remains open.
+    guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+    guard panel.dataSource === (self as AnyObject) else { return }
+    panel.reloadData()
+  }
 }
 
 extension FilesViewController: NSMenuItemValidation {
@@ -704,10 +1061,160 @@ extension FilesViewController: NSMenuItemValidation {
       guard let targetRow = targetRows.first else { return false }
       guard let _ = outlineView.item(atRow: targetRow) as? FileNode else { return false }
       return true
+    case #selector(quickLookPreviewItems(_:)):
+      // Enable the standard Quick Look menu item whenever any FileNode
+      // (file or directory) is selected — Finder allows Quick Look on
+      // directories too, showing the folder icon + metadata.
+      guard !selectedRows.isEmpty else { return false }
+      return selectedRows.contains(where: { outlineView.item(atRow: $0) is FileNode })
     default:
       return false
     }
   }
+}
+
+extension FilesViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+  func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+    selectedNodesForQuickLook().count
+  }
+
+  func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+    let nodes = selectedNodesForQuickLook()
+    guard index >= 0, index < nodes.count else { return nil }
+    let node = nodes[index]
+
+    // For videos, install/refresh the streaming AVPlayerView overlay over
+    // whatever Quick Look is rendering. For everything else (directories
+    // and non-video files alike) drop the overlay so the standard Quick
+    // Look chrome shows through.
+    let pathExtension = (node.name as NSString).pathExtension
+    let isVideo = !node.isDirectory && Self.isVideoExtension(pathExtension)
+    if isVideo {
+      let smbPath = dirTree.resolvePath(node)
+      presentQuickLookVideoOverlay(for: node, smbPath: smbPath)
+    } else {
+      removeQuickLookVideoOverlay()
+    }
+    return quickLookItem(for: node)
+  }
+
+  /// Re-route key events received by the QLPreviewPanel back to the source
+  /// outline view. Without this, arrow keys inside the panel just beep because
+  /// nothing along the panel's responder chain knows what to do with them.
+  /// Mirrors the QuickLookDownloader Apple sample.
+  func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+    if event.type == .keyDown {
+      outlineView.keyDown(with: event)
+      return true
+    }
+    return false
+  }
+}
+
+/// QLPreviewItem backed by a local-disk URL. The URL is mutable so the
+/// owner can swap in real downloaded contents (and call
+/// `QLPreviewPanel.refreshCurrentPreviewItem()`) once a background download
+/// completes — the placeholder pattern Apple's docs describe for remote
+/// content. A shared scratch directory under the process temp dir hosts all
+/// per-item subfolders.
+final class QuickLookItem: NSObject, QLPreviewItem {
+  let title: String
+  let smbPath: String
+  var localURL: URL
+
+  static let scratchDirectory: URL = {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("SMBeam-QuickLook", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }()
+
+  init(title: String, smbPath: String, localURL: URL) {
+    self.title = title
+    self.smbPath = smbPath
+    self.localURL = localURL
+  }
+
+  var previewItemURL: URL! { localURL }
+  var previewItemTitle: String! { title }
+}
+
+// MARK: - Drag-out (file promise)
+
+extension FilesViewController: NSFilePromiseProviderDelegate {
+  /// Returns the on-disk file name Finder should use for the dropped file.
+  /// Finder appends "copy" / number suffixes if a file with that name
+  /// already exists at the drop location, so we don't have to handle
+  /// collisions ourselves.
+  func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+    if let info = filePromiseProvider.userInfo as? SMBPromiseInfo {
+      return (info.smbPath as NSString).lastPathComponent
+    }
+    return "Untitled"
+  }
+
+  /// AppKit invokes this on the queue returned from `operationQueue(for:)`
+  /// once the user drops on a destination. We delegate the actual byte
+  /// streaming to a `FileDownload` queued through `TransferQueue` so the
+  /// Activities panel reflects the work, while reporting completion back
+  /// to AppKit so it can dismiss its drag-progress indicator.
+  func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
+    guard let info = filePromiseProvider.userInfo as? SMBPromiseInfo else {
+      completionHandler(URLError(.badURL))
+      return
+    }
+
+    let download = FileDownload(
+      sourcePath: info.smbPath,
+      isDirectory: info.isDirectory,
+      destination: url,
+      accessor: treeAccessor
+    )
+
+    // Pre-set a progressHandler that resolves Finder's file promise on
+    // terminal state. TransferQueue.addFileTransfer chains our handler in
+    // front of its own throttled UI handler, so both run.
+    let lock = NSLock()
+    var resolved = false
+    download.progressHandler = { state in
+      let outcome: Result<Void, Error>?
+      switch state {
+      case .completed: outcome = .success(())
+      case .failed(let error): outcome = .failure(error)
+      case .queued, .started: outcome = nil
+      }
+      guard let outcome else { return }
+      lock.lock()
+      if resolved { lock.unlock(); return }
+      resolved = true
+      lock.unlock()
+      switch outcome {
+      case .success: completionHandler(nil)
+      case .failure(let error): completionHandler(error)
+      }
+    }
+
+    Task { @MainActor in
+      TransferQueue.shared.addFileTransfer(download)
+      // Surface the Activities panel so the user sees progress, matching
+      // the upload-on-drop behaviour.
+      NotificationCenter.default.post(name: Self.didStartActivities, object: self)
+    }
+  }
+
+  /// Serial queue used for AppKit's writePromiseTo callbacks. We don't
+  /// actually do work here — the work happens in TransferQueue's actor —
+  /// but AppKit requires a non-main queue so the call doesn't block UI.
+  func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+    Self.filePromiseQueue
+  }
+
+  private static let filePromiseQueue: OperationQueue = {
+    let queue = OperationQueue()
+    queue.qualityOfService = .userInitiated
+    queue.name = "com.kishikawakatsumi.smbeam.file-promise"
+    return queue
+  }()
 }
 
 extension FilesViewController: NSTextFieldDelegate {
@@ -758,5 +1265,43 @@ func join(_ paths: String...) -> String {
     return paths.dropFirst().joined(separator: "/")
   } else {
     return paths.joined(separator: "/")
+  }
+}
+
+/// NSTextField subclass that mimics Finder's "select basename, leave extension"
+/// behaviour when entering edit mode. AppKit's auto-select-all happens *after*
+/// `NSTextFieldDelegate.controlTextDidBeginEditing(_:)` and after a synchronous
+/// `selectedRange = …` from `becomeFirstResponder()`, so the override has to
+/// dispatch to the next runloop tick on the responder path. The mouse path
+/// already has the field editor installed by the time `super.mouseDown` returns,
+/// so we can update the selection synchronously there.
+///
+/// Reference: CotEditor's FilenameTextField
+/// (https://github.com/coteditor/CotEditor — Apache 2.0).
+class FilenameTextField: NSTextField {
+  override func mouseDown(with event: NSEvent) {
+    super.mouseDown(with: event)
+    currentEditor()?.smbeam_selectFilenameStem()
+  }
+
+  override func becomeFirstResponder() -> Bool {
+    guard super.becomeFirstResponder() else { return false }
+    DispatchQueue.main.async { [weak self] in
+      self?.currentEditor()?.smbeam_selectFilenameStem()
+    }
+    return true
+  }
+}
+
+private extension NSText {
+  /// Selects the filename stem (the portion preceding the trailing
+  /// `.<ext>`). For names without a "real" extension — directories without
+  /// dot-suffixes, dotfiles like `.gitignore`, names like `README` —
+  /// the entire string is selected, matching Finder.
+  func smbeam_selectFilenameStem() {
+    let name = self.string as NSString
+    let stem = (name.deletingPathExtension as NSString)
+    let length = stem.length > 0 ? stem.length : name.length
+    self.selectedRange = NSRange(location: 0, length: length)
   }
 }

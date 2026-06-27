@@ -47,7 +47,11 @@ public class SMBClient {
 
   @discardableResult
   public func logoff() async throws -> Logoff.Response {
-    try await session.logoff()
+    defer {
+      session.disconnect()
+    }
+    let response = try await session.logoff()
+    return response
   }
 
   public func listShares() async throws -> [Share] {
@@ -263,7 +267,7 @@ extension Share.ShareType: CustomStringConvertible {
       type.append("IPC")
     case SType.clusterFS:
       type.append("Cluster FS")
-    case SType.clusterDFS:
+    case SType.clusterSOFS:
       type.append("Cluster SOFS")
     case SType.clusterDFS:
       type.append("Cluster DFS")
