@@ -13,16 +13,16 @@ public class SMBClient {
         }
     }
     
-    deinit {
-        print("\(#file):\(#function) :: deinit")
-    }
+//    deinit {
+//        print("\(#file):\(#function) :: deinit")
+//    }
     
     public init(host: String) {
         self.host = host
         port = 445
         session = Session(host: host)
         onDisconnected = { _ in }
-        print("\(#file):\(#function) :: init")
+//        print("\(#file):\(#function) :: init")
     }
     
     public init(host: String, port: Int) {
@@ -30,7 +30,7 @@ public class SMBClient {
         self.port = port
         session = Session(host: host, port: port)
         onDisconnected = { _ in }
-        print("\(#file):\(#function) :: init")
+//        print("\(#file):\(#function) :: init")
     }
     
     @discardableResult
